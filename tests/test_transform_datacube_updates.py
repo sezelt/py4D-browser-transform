@@ -35,10 +35,13 @@ def _install_pyqt_stubs(monkeypatch):
     class QMessageBox:
         Yes = 1
         No = 2
+        Cancel = 3
+
+        question_result = Yes
 
         @staticmethod
         def question(*_args, **_kwargs):
-            return QMessageBox.Yes
+            return QMessageBox.question_result
 
         @staticmethod
         def warning(*_args, **_kwargs):
@@ -123,25 +126,16 @@ class _Datacube:
         pass
 
 
-class _Parent:
+class _API:
+    """Mock of the 1.6 plugin API broker object."""
+
     def __init__(self, data):
         self.datacube = _Datacube(data)
+        self.qt_window = object()
         self.set_datacube_calls = []
 
-    def windowTitle(self):
-        return "existing title"
-
-    def set_datacube(self, datacube, window_title):
-        self.set_datacube_calls.append((datacube, window_title))
-
-    def update_scalebars(self):
-        raise AssertionError("manual refresh should go through set_datacube")
-
-    def update_diffraction_space_view(self, reset=False):
-        raise AssertionError("manual refresh should go through set_datacube")
-
-    def update_real_space_view(self, reset=False):
-        raise AssertionError("manual refresh should go through set_datacube")
+    def set_datacube(self, datacube, refresh=True):
+        self.set_datacube_calls.append((datacube, refresh))
 
 
 class _Dialog:
@@ -156,12 +150,28 @@ class _Dialog:
         return self._values
 
 
+class _TransformDialog:
+    def __init__(self, operations, accepted):
+        self._operations = operations
+        self._accepted = accepted
+
+    def exec_(self):
+        return self._accepted
+
+    def get_operations(self):
+        return self._operations
+
+
+def _identity_operations():
+    return [{"slice": ":", "bin": 1} for _ in range(4)]
+
+
 def test_axis_permutation_uses_set_datacube(monkeypatch):
     module = _load_transform_module(monkeypatch)
     data = np.arange(2 * 3 * 4 * 5).reshape(2, 3, 4, 5)
-    parent = _Parent(data.copy())
+    api = _API(data.copy())
     plugin = object.__new__(module.TransformPlugin)
-    plugin.parent = parent
+    plugin.api = api
     plugin.current_permutation = [0, 1, 2, 3]
 
     new_permutation = [0, 2, 1, 3]
@@ -173,17 +183,17 @@ def test_axis_permutation_uses_set_datacube(monkeypatch):
 
     plugin.set_axis_permutation()
 
-    np.testing.assert_array_equal(parent.datacube.data, np.transpose(data, new_permutation))
+    np.testing.assert_array_equal(api.datacube.data, np.transpose(data, new_permutation))
     assert plugin.current_permutation == new_permutation
-    assert parent.set_datacube_calls == [(parent.datacube, "existing title")]
+    assert api.set_datacube_calls == [(api.datacube, True)]
 
 
 def test_diffraction_flips_uses_set_datacube(monkeypatch):
     module = _load_transform_module(monkeypatch)
     data = np.arange(2 * 3 * 4 * 5).reshape(2, 3, 4, 5)
-    parent = _Parent(data.copy())
+    api = _API(data.copy())
     plugin = object.__new__(module.TransformPlugin)
-    plugin.parent = parent
+    plugin.api = api
     plugin.flip_settings = {"flipud": False, "fliplr": False, "transpose": False}
 
     new_flips = {"flipud": True, "fliplr": True, "transpose": True}
@@ -196,14 +206,14 @@ def test_diffraction_flips_uses_set_datacube(monkeypatch):
     plugin.set_diffraction_flips()
 
     expected = np.transpose(np.flip(np.flip(data, axis=2), axis=3), (0, 1, 3, 2))
-    np.testing.assert_array_equal(parent.datacube.data, expected)
+    np.testing.assert_array_equal(api.datacube.data, expected)
     assert plugin.flip_settings == new_flips
-    assert parent.set_datacube_calls == [(parent.datacube, "existing title")]
+    assert api.set_datacube_calls == [(api.datacube, True)]
 
 
-def _new_plugin(module, parent):
+def _new_plugin(module, api):
     plugin = object.__new__(module.TransformPlugin)
-    plugin.parent = parent
+    plugin.api = api
     plugin.current_permutation = list(module.DEFAULT_PERMUTATION)
     plugin.flip_settings = dict(module.DEFAULT_FLIP_SETTINGS)
     plugin.checkpoints = []
@@ -211,18 +221,90 @@ def _new_plugin(module, parent):
     return plugin
 
 
+def test_transform_datacube_cancel_aborts(monkeypatch):
+    module = _load_transform_module(monkeypatch)
+    api = _API(np.arange(2 * 3 * 4 * 5).reshape(2, 3, 4, 5))
+    plugin = _new_plugin(module, api)
+    module.QMessageBox.question_result = module.QMessageBox.Cancel
+
+    created = {"called": False}
+
+    def _dialog(*_args):
+        created["called"] = True
+        return _TransformDialog(_identity_operations(), module.QDialog.Rejected)
+
+    monkeypatch.setattr(module, "TransformDatacubeDialog", _dialog)
+
+    result = plugin.transform_datacube()
+
+    assert result is None
+    assert api.set_datacube_calls == []
+    assert plugin.checkpoints == []
+    assert created["called"] is False
+
+
+def test_transform_datacube_no_skips_checkpoint_and_transforms(monkeypatch):
+    module = _load_transform_module(monkeypatch)
+    data = np.arange(2 * 3 * 4 * 5).reshape(2, 3, 4, 5)
+    api = _API(data.copy())
+    plugin = _new_plugin(module, api)
+    module.QMessageBox.question_result = module.QMessageBox.No
+
+    monkeypatch.setattr(
+        module,
+        "TransformDatacubeDialog",
+        lambda *_args: _TransformDialog(_identity_operations(), module.QDialog.Accepted),
+    )
+
+    transformed = plugin.transform_datacube()
+
+    assert transformed is not None
+    assert plugin.checkpoints == []
+    assert len(api.set_datacube_calls) == 1
+    np.testing.assert_array_equal(transformed.data, data)
+
+
+def test_transform_datacube_yes_creates_checkpoint_then_transforms(monkeypatch):
+    module = _load_transform_module(monkeypatch)
+    data = np.arange(2 * 3 * 4 * 5).reshape(2, 3, 4, 5)
+    api = _API(data.copy())
+    plugin = _new_plugin(module, api)
+    module.QMessageBox.question_result = module.QMessageBox.Yes
+
+    operations = [
+        {"slice": ":", "bin": 1},
+        {"slice": ":", "bin": 1},
+        {"slice": ":", "bin": 2},
+        {"slice": ":", "bin": 1},
+    ]
+    monkeypatch.setattr(
+        module, "TransformDatacubeDialog", lambda *_args: _TransformDialog(operations, module.QDialog.Accepted)
+    )
+
+    transformed = plugin.transform_datacube()
+
+    assert transformed is not None
+    assert len(plugin.checkpoints) == 1
+    # The checkpoint captured the original (pre-transform) datacube.
+    assert plugin.checkpoints[0].shape == data.shape
+    np.testing.assert_array_equal(plugin.checkpoints[0].datacube.data, data)
+    # The transform was still applied (axis 2 binned by 2).
+    assert transformed.data.shape == (2, 3, 2, 5)
+    assert len(api.set_datacube_calls) == 1
+
+
 def test_checkpoint_restore_uses_independent_copies(monkeypatch):
     module = _load_transform_module(monkeypatch)
     data = np.arange(2 * 3 * 4 * 5).reshape(2, 3, 4, 5)
-    parent = _Parent(data.copy())
-    parent.datacube.calibration.set_R_pixel_size(2)
-    plugin = _new_plugin(module, parent)
+    api = _API(data.copy())
+    api.datacube.calibration.set_R_pixel_size(2)
+    plugin = _new_plugin(module, api)
     plugin.current_permutation = [0, 2, 1, 3]
     plugin.flip_settings = {"flipud": True, "fliplr": False, "transpose": False}
 
     checkpoint = plugin.create_checkpoint("before")
-    parent.datacube.data[...] = -1
-    parent.datacube.calibration.set_R_pixel_size(9)
+    api.datacube.data[...] = -1
+    api.datacube.calibration.set_R_pixel_size(9)
 
     restored = plugin.restore_checkpoint(checkpoint.checkpoint_id)
 
@@ -237,20 +319,20 @@ def test_checkpoint_restore_uses_independent_copies(monkeypatch):
         "dtype": str(data.dtype),
         "estimated_bytes": data.nbytes,
     }
-    assert parent.set_datacube_calls == [(restored, "existing title")]
+    assert api.set_datacube_calls == [(restored, True)]
 
 
 def test_checkpoint_delete_rename_replace_and_memory(monkeypatch):
     module = _load_transform_module(monkeypatch)
-    parent = _Parent(np.arange(2 * 3 * 4 * 5).reshape(2, 3, 4, 5))
-    plugin = _new_plugin(module, parent)
+    api = _API(np.arange(2 * 3 * 4 * 5).reshape(2, 3, 4, 5))
+    plugin = _new_plugin(module, api)
 
     checkpoint = plugin.create_checkpoint("old")
     plugin.rename_checkpoint(checkpoint.checkpoint_id, "renamed")
     assert plugin.checkpoints[0].name == "renamed"
-    assert plugin.total_checkpoint_bytes() == parent.datacube.data.nbytes
+    assert plugin.total_checkpoint_bytes() == api.datacube.data.nbytes
 
-    parent.datacube.data = np.zeros((1, 1, 2, 2), dtype=np.float32)
+    api.datacube.data = np.zeros((1, 1, 2, 2), dtype=np.float32)
     replacement = plugin.replace_checkpoint(checkpoint.checkpoint_id)
     assert replacement.name == "renamed"
     assert replacement.checkpoint_id == checkpoint.checkpoint_id

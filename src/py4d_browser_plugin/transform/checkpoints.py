@@ -17,7 +17,6 @@ class DatacubeCheckpoint:
     estimated_bytes: int
     datacube: object
     metadata: dict
-    window_title: str
 
 
 def copy_datacube(datacube):

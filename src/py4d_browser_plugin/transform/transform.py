@@ -41,12 +41,13 @@ _checkpoint_metadata = checkpoint_metadata
 
 class TransformPlugin(QWidget):
     plugin_id = "chiahao3.transform"
+    api_version = (1, 6)
     uses_plugin_menu = True
     display_name = "Transform"
 
-    def __init__(self, parent, plugin_menu, **kwargs):
+    def __init__(self, api, plugin_menu, **kwargs):
         super().__init__()
-        self.parent = parent
+        self.api = api
         self.current_permutation = list(DEFAULT_PERMUTATION)
         self.flip_settings = dict(DEFAULT_FLIP_SETTINGS)
         self.checkpoints = []
@@ -54,6 +55,11 @@ class TransformPlugin(QWidget):
 
         self.transform_menu = plugin_menu
         self._setup_menu_actions()
+
+    def close(self):
+        # The loader calls this on unload. Nothing to tear down here; the
+        # RAM checkpoints live on the plugin instance and are dropped with it.
+        pass
 
     # Menu setup
 
@@ -79,8 +85,7 @@ class TransformPlugin(QWidget):
         self.transform_menu.addAction(self.restore_checkpoint_action)
 
     def _set_transformed_datacube(self):
-        parent = self.parent
-        parent.set_datacube(parent.datacube, parent.windowTitle())
+        self.api.set_datacube(self.api.datacube)
 
     # Checkpoint workflow
 
@@ -97,7 +102,7 @@ class TransformPlugin(QWidget):
         return sum(checkpoint.estimated_bytes for checkpoint in self.checkpoints)
 
     def create_checkpoint(self, name=None):
-        datacube = self.parent.datacube
+        datacube = self.api.datacube
         checkpoint_datacube = copy_datacube(datacube)
         metadata = checkpoint_metadata(datacube)
         checkpoint = DatacubeCheckpoint(
@@ -109,7 +114,6 @@ class TransformPlugin(QWidget):
             estimated_bytes=metadata["estimated_bytes"],
             datacube=checkpoint_datacube,
             metadata=metadata,
-            window_title=self.parent.windowTitle(),
         )
         self.checkpoints.append(checkpoint)
         return checkpoint
@@ -137,7 +141,7 @@ class TransformPlugin(QWidget):
         restored_datacube = copy_datacube(checkpoint.datacube)
         self.current_permutation = list(DEFAULT_PERMUTATION)
         self.flip_settings = dict(DEFAULT_FLIP_SETTINGS)
-        self.parent.set_datacube(restored_datacube, checkpoint.window_title)
+        self.api.set_datacube(restored_datacube)
         return restored_datacube
 
     def _confirm_checkpoint_save(self, checkpoint_bytes):
@@ -154,7 +158,7 @@ class TransformPlugin(QWidget):
         )
         return (
             QMessageBox.question(
-                self,
+                self.api.qt_window,
                 "Save RAM Checkpoint",
                 message,
                 QMessageBox.Yes | QMessageBox.No,
@@ -164,29 +168,31 @@ class TransformPlugin(QWidget):
         )
 
     def save_ram_checkpoint(self):
-        if self.parent.datacube is None:
-            QMessageBox.warning(self, "Save RAM Checkpoint", "No datacube is loaded.")
+        if self.api.datacube is None:
+            QMessageBox.warning(
+                self.api.qt_window, "Save RAM Checkpoint", "No datacube is loaded."
+            )
             return None
         dialog = SaveCheckpointDialog(
-            self,
+            self.api.qt_window,
             self._default_checkpoint_name(),
-            self.parent.datacube.data.shape,
-            self.parent.datacube.data.dtype,
-            datacube_nbytes(self.parent.datacube),
+            self.api.datacube.data.shape,
+            self.api.datacube.data.dtype,
+            datacube_nbytes(self.api.datacube),
         )
         if dialog.exec_() != QDialog.Accepted:
             return None
-        if not self._confirm_checkpoint_save(datacube_nbytes(self.parent.datacube)):
+        if not self._confirm_checkpoint_save(datacube_nbytes(self.api.datacube)):
             return None
         return self.create_checkpoint(dialog.get_name())
 
     def restore_ram_checkpoint(self):
         if not self.checkpoints:
             QMessageBox.information(
-                self, "Restore RAM Checkpoint", "No RAM checkpoints have been saved."
+                self.api.qt_window, "Restore RAM Checkpoint", "No RAM checkpoints have been saved."
             )
             return None
-        dialog = RestoreCheckpointDialog(self, self.checkpoints)
+        dialog = RestoreCheckpointDialog(self.api.qt_window, self.checkpoints)
         result = dialog.exec_()
         action, checkpoint_id, name = dialog.get_action()
         if action == "delete" and checkpoint_id is not None:
@@ -196,7 +202,7 @@ class TransformPlugin(QWidget):
             self.rename_checkpoint(checkpoint_id, name)
             return None
         if action == "replace" and checkpoint_id is not None:
-            if self._confirm_checkpoint_save(datacube_nbytes(self.parent.datacube)):
+            if self._confirm_checkpoint_save(datacube_nbytes(self.api.datacube)):
                 return self.replace_checkpoint(checkpoint_id)
             return None
         if result == QDialog.Accepted and action == "restore" and checkpoint_id is not None:
@@ -206,79 +212,94 @@ class TransformPlugin(QWidget):
     # Datacube transform workflow
 
     def transform_datacube(self):
-        if self.parent.datacube is None:
-            QMessageBox.warning(self, SLICE_SUBSAMPLE_BIN_LABEL, "No datacube is loaded.")
+        if self.api.datacube is None:
+            QMessageBox.warning(
+                self.api.qt_window, SLICE_SUBSAMPLE_BIN_LABEL, "No datacube is loaded."
+            )
             return None
         if not self.checkpoints:
             prompt = (
                 "Create a RAM checkpoint before transforming this datacube?\n"
-                "Transforms replace the current in-memory datacube."
+                "Transforms replace the current in-memory datacube.\n\n"
+                "Yes - checkpoint now, then transform\n"
+                "No - transform now, without a checkpoint\n"
+                "Cancel - do nothing"
             )
-            if (
-                QMessageBox.question(
-                    self,
-                    SLICE_SUBSAMPLE_BIN_LABEL,
-                    prompt,
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.Yes,
-                )
-                != QMessageBox.Yes
-            ):
+            choice = QMessageBox.question(
+                self.api.qt_window,
+                SLICE_SUBSAMPLE_BIN_LABEL,
+                prompt,
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if choice == QMessageBox.Cancel:
                 return None
-            if not self._confirm_checkpoint_save(datacube_nbytes(self.parent.datacube)):
-                return None
-            self.create_checkpoint()
+            if choice == QMessageBox.Yes:
+                if not self._confirm_checkpoint_save(datacube_nbytes(self.api.datacube)):
+                    return None
+                self.create_checkpoint()
+            # No: proceed without checkpointing
 
-        dialog = TransformDatacubeDialog(self, self.parent.datacube.data.shape)
+        dialog = TransformDatacubeDialog(
+            self.api.qt_window, self.api.datacube.data.shape
+        )
         if dialog.exec_() != QDialog.Accepted:
             return None
         try:
             transformed = apply_datacube_operations(
-                self.parent.datacube, dialog.get_operations()
+                self.api.datacube, dialog.get_operations()
             )
         except ValueError as exc:
-            QMessageBox.warning(self, SLICE_SUBSAMPLE_BIN_LABEL, str(exc))
+            QMessageBox.warning(self.api.qt_window, SLICE_SUBSAMPLE_BIN_LABEL, str(exc))
             return None
-        self.parent.set_datacube(transformed, self.parent.windowTitle())
+        self.api.set_datacube(transformed)
         return transformed
 
     # Existing flip/permutation actions
 
     def set_axis_permutation(self):
-        parent = self.parent
-        dialog = AxisPermutationDialog(self, self.current_permutation)
+        dialog = AxisPermutationDialog(
+            self.api.qt_window, self.current_permutation
+        )
         if dialog.exec_() == QDialog.Accepted:
             new_permutation = dialog.get_values()
             print(f"Axis permutation set to: {new_permutation}")
 
             inverse_permutation = np.argsort(self.current_permutation)
-            parent.datacube.data = np.transpose(parent.datacube.data, inverse_permutation)
-            parent.datacube.data = np.transpose(parent.datacube.data, new_permutation)
+            self.api.datacube.data = np.transpose(
+                self.api.datacube.data, inverse_permutation
+            )
+            self.api.datacube.data = np.transpose(
+                self.api.datacube.data, new_permutation
+            )
             self.current_permutation = new_permutation
 
             self._set_transformed_datacube()
 
     def set_diffraction_flips(self):
-        parent = self.parent
-        dialog = DiffractionFlipsDialog(self, self.flip_settings)
+        dialog = DiffractionFlipsDialog(self.api.qt_window, self.flip_settings)
         if dialog.exec_() == QDialog.Accepted:
             new_flip_settings = dialog.get_values()
             print(f"Diffraction flips set to: {new_flip_settings}")
 
             if new_flip_settings != self.flip_settings:
                 if self.flip_settings["transpose"]:
-                    parent.datacube.data = np.transpose(parent.datacube.data, (0, 1, 3, 2))
+                    self.api.datacube.data = np.transpose(
+                        self.api.datacube.data, (0, 1, 3, 2)
+                    )
                 if self.flip_settings["fliplr"]:
-                    parent.datacube.data = np.flip(parent.datacube.data, axis=3)
+                    self.api.datacube.data = np.flip(self.api.datacube.data, axis=3)
                 if self.flip_settings["flipud"]:
-                    parent.datacube.data = np.flip(parent.datacube.data, axis=2)
+                    self.api.datacube.data = np.flip(self.api.datacube.data, axis=2)
 
                 if new_flip_settings["flipud"]:
-                    parent.datacube.data = np.flip(parent.datacube.data, axis=2)
+                    self.api.datacube.data = np.flip(self.api.datacube.data, axis=2)
                 if new_flip_settings["fliplr"]:
-                    parent.datacube.data = np.flip(parent.datacube.data, axis=3)
+                    self.api.datacube.data = np.flip(self.api.datacube.data, axis=3)
                 if new_flip_settings["transpose"]:
-                    parent.datacube.data = np.transpose(parent.datacube.data, (0, 1, 3, 2))
+                    self.api.datacube.data = np.transpose(
+                        self.api.datacube.data, (0, 1, 3, 2)
+                    )
 
                 self.flip_settings = new_flip_settings
                 self._set_transformed_datacube()
